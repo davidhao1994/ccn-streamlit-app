@@ -774,7 +774,7 @@ def main():
 - R²: {test_metrics['R²']:.4f}
 - RMSE: {test_metrics['RMSE']:.4f}
 - MAE: {test_metrics['MAE']:.4f}
-- MAPE: {test_metrics['MAPE (%)']}:.2f}%
+- MAPE: {test_metrics['MAPE (%)']:.2f}%
 
 ## Dataset
 - Training Samples: {len(st.session_state['X_test']) * (100-test_size) // test_size}
