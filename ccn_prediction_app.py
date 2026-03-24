@@ -5,8 +5,6 @@ streamlit run ccn_prediction_app.py --server.port 8501
 A user-friendly web application for predicting Cloud Condensation Nuclei (CCN) 
 concentrations using machine learning and lognormal mode fitting.
 
-
-
 Features:
 - Data upload and preview
 - Automatic lognormal mode fitting
