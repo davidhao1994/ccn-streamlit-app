@@ -1,0 +1,7 @@
+git add .
+git commit -m "comment"
+git push
+
+Only the first time:
+git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+git push -f origin main
