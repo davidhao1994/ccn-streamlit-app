@@ -12,6 +12,7 @@ Features:
 - Interactive visualizations
 - Model performance metrics
 - Feature importance analysis
+- SHAP explainability analysis
 - Export predictions
 """
 
@@ -41,6 +42,13 @@ try:
     XGB_AVAILABLE = True
 except:
     XGB_AVAILABLE = False
+
+# SHAP (optional explainability dependency)
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except:
+    SHAP_AVAILABLE = False
 
 # Settings
 warnings.filterwarnings('ignore')
@@ -2035,6 +2043,7 @@ def main():
                     st.session_state['scaler'] = scaler
                     st.session_state['features'] = available_features
                     st.session_state['X_test'] = X_test
+                    st.session_state['X_test_scaled'] = X_test_scaled
                     st.session_state['y_test'] = y_test
                     st.session_state['y_test_pred'] = y_test_pred
                     st.session_state['train_metrics'] = train_metrics
@@ -2119,6 +2128,129 @@ def main():
                     st.pyplot(fig)
                     
                     st.dataframe(importance_df, use_container_width=True)
+
+                # SHAP explainability
+                st.subheader("SHAP Explainability")
+
+                if not SHAP_AVAILABLE:
+                    st.warning("SHAP is not installed. Install with: pip install shap")
+                elif 'X_test_scaled' not in st.session_state:
+                    st.warning("SHAP requires scaled test features. Please retrain the model once.")
+                else:
+                    test_n = len(st.session_state['X_test_scaled'])
+                    if test_n < 2:
+                        st.warning("Not enough test samples for SHAP analysis.")
+                        st.stop()
+
+                    shap_min = 10 if test_n >= 10 else 2
+                    shap_max = min(2000, test_n)
+                    default_shap = min(500, shap_max)
+                    shap_step = 10 if shap_max < 100 else 50
+
+                    shap_sample_size = st.slider(
+                        "SHAP sample size",
+                        min_value=shap_min,
+                        max_value=shap_max,
+                        value=default_shap,
+                        step=shap_step,
+                        help="Number of test samples used for SHAP calculation"
+                    )
+
+                    if st.button("🔍 Run SHAP Analysis", use_container_width=True):
+                        with st.spinner("Calculating SHAP values..."):
+                            try:
+                                X_test_scaled = st.session_state['X_test_scaled']
+
+                                # Keep SHAP compute bounded for responsiveness.
+                                sample_n = min(shap_sample_size, len(X_test_scaled))
+                                sampled_idx = np.random.RandomState(random_state).choice(
+                                    len(X_test_scaled),
+                                    size=sample_n,
+                                    replace=False
+                                )
+
+                                X_shap = pd.DataFrame(
+                                    X_test_scaled[sampled_idx],
+                                    columns=features
+                                )
+
+                                explainer = shap.TreeExplainer(model)
+                                shap_values = explainer.shap_values(X_shap)
+
+                                if isinstance(shap_values, list):
+                                    shap_values = shap_values[0]
+
+                                st.success(f"✅ SHAP analysis complete on {sample_n} samples")
+
+                                col_shap1, col_shap2 = st.columns(2)
+
+                                with col_shap1:
+                                    st.markdown("**Global SHAP Importance (mean |SHAP|)**")
+                                    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+                                    shap_imp_df = pd.DataFrame({
+                                        'Feature': features,
+                                        'Mean |SHAP|': mean_abs_shap
+                                    }).sort_values('Mean |SHAP|', ascending=False)
+
+                                    top_k = min(20, len(shap_imp_df))
+                                    fig_shap_bar, ax_shap_bar = plt.subplots(figsize=(8, 7))
+                                    ax_shap_bar.barh(
+                                        shap_imp_df.head(top_k)['Feature'][::-1],
+                                        shap_imp_df.head(top_k)['Mean |SHAP|'][::-1],
+                                        color='teal',
+                                        alpha=0.8
+                                    )
+                                    ax_shap_bar.set_xlabel('Mean |SHAP value|')
+                                    ax_shap_bar.set_title(f'Top {top_k} SHAP Features')
+                                    ax_shap_bar.grid(True, alpha=0.3, axis='x')
+                                    st.pyplot(fig_shap_bar)
+
+                                    st.dataframe(shap_imp_df, use_container_width=True)
+
+                                with col_shap2:
+                                    st.markdown("**SHAP Summary Plot (Beeswarm)**")
+                                    fig_summary, ax_summary = plt.subplots(figsize=(8, 7))
+                                    shap.summary_plot(
+                                        shap_values,
+                                        X_shap,
+                                        show=False,
+                                        max_display=min(20, len(features))
+                                    )
+                                    st.pyplot(plt.gcf())
+                                    plt.close(plt.gcf())
+
+                                st.markdown("**Local Explanation (single sample)**")
+                                sample_idx_local = st.number_input(
+                                    "Select local sample index",
+                                    min_value=0,
+                                    max_value=sample_n - 1,
+                                    value=0,
+                                    step=1
+                                )
+
+                                local_vals = shap_values[int(sample_idx_local)]
+                                local_abs_order = np.argsort(np.abs(local_vals))[::-1][:15]
+
+                                local_df = pd.DataFrame({
+                                    'Feature': X_shap.columns[local_abs_order],
+                                    'SHAP Value': local_vals[local_abs_order],
+                                    'Feature Value (scaled)': X_shap.iloc[int(sample_idx_local), local_abs_order].values
+                                })
+
+                                fig_local, ax_local = plt.subplots(figsize=(10, 6))
+                                bar_colors = ['crimson' if v > 0 else 'royalblue' for v in local_df['SHAP Value']]
+                                ax_local.barh(local_df['Feature'][::-1], local_df['SHAP Value'][::-1], color=bar_colors[::-1], alpha=0.85)
+                                ax_local.axvline(0, color='black', linewidth=1)
+                                ax_local.set_xlabel('SHAP value contribution')
+                                ax_local.set_title('Top Local Feature Contributions')
+                                ax_local.grid(True, alpha=0.3, axis='x')
+                                st.pyplot(fig_local)
+
+                                st.dataframe(local_df, use_container_width=True)
+
+                            except Exception as e:
+                                st.error(f"❌ SHAP analysis failed: {str(e)}")
+                                st.info("Tip: try a smaller SHAP sample size or switch to Random Forest/XGBoost.")
         
         # ===== Tab 5: Export =====
         with tab5:
