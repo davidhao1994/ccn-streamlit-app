@@ -1,3 +1,4 @@
+cd ccn-streamlit-app
 git add .
 git commit -m "comment"
 git push

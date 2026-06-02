@@ -106,6 +106,12 @@ st.markdown("""
 
 def extract_diameter(col_name):
     """Extract diameter value (in nm) from column name."""
+    # Preferred SMPS format: SMPS_Dp_10_60nm -> 10.60
+    match = re.search(r'SMPS_Dp_(\d+)_(\d+)nm', col_name, re.IGNORECASE)
+    if match:
+        return float(f"{match.group(1)}.{match.group(2)}")
+
+    # Legacy format: Particle_Size_10_60nm -> 10.60
     match = re.search(r'Particle_Size_(\d+)_(\d+)nm', col_name, re.IGNORECASE)
     if match:
         return float(f"{match.group(1)}.{match.group(2)}")
@@ -119,6 +125,22 @@ def extract_diameter(col_name):
         return float(match.group(1))
     
     return None
+
+
+def is_particle_size_column(col_name):
+    """Identify supported particle-size column names (SMPS and legacy Particle_Size)."""
+    return bool(
+        re.search(r'^SMPS_Dp_\d+_\d+nm$', col_name, re.IGNORECASE)
+        or re.search(r'^Particle_Size_\d+_\d+nm$', col_name, re.IGNORECASE)
+    )
+
+
+def is_supersaturation_feature(col_name):
+    """Identify columns that represent supersaturation-like variables."""
+    c = str(col_name).strip().lower()
+    if c in {'supersaturation', 'super_saturation', 'supersaturation_%', 'ss', 'ss_%', 's'}:
+        return True
+    return ('supersaturation' in c) or ('super_saturation' in c)
 
 
 def lognormal_distribution(Dp, N, Dpg, sigma_g):
@@ -162,41 +184,23 @@ def fit_three_modes_optimized(diameters, concentrations, maxfev=500):
     
     # Initial guess optimization
     max_conc = np.max(concentrations)
-    
-    # Find peaks for better initial guesses
-    peak_idx = np.argmax(concentrations)
-    peak_dp = diameters[peak_idx]
-    
-    # Smart initial guesses based on data
-    if peak_dp < 30:
-        # Nucleation mode dominant
-        initial_guess = [
-            max_conc * 0.7, 15, 1.5,    # Nucleation
-            max_conc * 0.2, 50, 1.6,    # Aitken
-            max_conc * 0.1, 150, 1.8    # Accumulation
-        ]
-    elif peak_dp < 100:
-        # Aitken mode dominant
-        initial_guess = [
-            max_conc * 0.2, 15, 1.5,    # Nucleation
-            max_conc * 0.6, 50, 1.6,    # Aitken
-            max_conc * 0.2, 150, 1.8    # Accumulation
-        ]
-    else:
-        # Accumulation mode dominant
-        initial_guess = [
-            max_conc * 0.1, 15, 1.5,    # Nucleation
-            max_conc * 0.2, 50, 1.6,    # Aitken
-            max_conc * 0.7, 150, 1.8    # Accumulation
-        ]
-    
-    # Tighter bounds for faster convergence
-    lower_bounds = [0, 5, 1.2,    # Nucleation
-                    0, 25, 1.2,   # Aitken
-                    0, 80, 1.2]   # Accumulation
-    upper_bounds = [np.inf, 30, 3.0,     # Nucleation
-                    np.inf, 100, 3.0,    # Aitken
-                    np.inf, 500, 3.0]    # Accumulation
+
+    initial_guess = [
+        max_conc * 0.2, 20, 1.5,
+        max_conc * 0.6, 60, 1.6,
+        max_conc * 0.2, 180, 1.8
+    ]
+
+    lower_bounds = [
+        0, 10, 1.2,
+        0, 30, 1.2,
+        0, 80, 1.2
+    ]
+    upper_bounds = [
+        np.inf, 35, 3.0,
+        np.inf, 120, 3.0,
+        np.inf, 514, 3.0
+    ]
     
     try:
         # Optimized fitting with reduced maxfev
@@ -275,7 +279,7 @@ def main():
         
         # Use default file if nothing uploaded
         if uploaded_file is None:
-            default_file = '/Users/star/Desktop/NPF-2/NPF_with_CCN_merged2.csv'
+            default_file = '/Users/star/Desktop/NPF-2/NPF_with_CCN_merged4.csv'
             if Path(default_file).exists():
                 st.info(f"Using default file:\n`{Path(default_file).name}`")
                 use_default = st.checkbox("Load default dataset", value=True)
@@ -331,7 +335,7 @@ def main():
             "Min Diameter (nm)",
             min_value=0.0,
             max_value=100.0,
-            value=66.5,
+            value=30.0,
             step=0.5,
             help="Minimum particle diameter to include"
         )
@@ -371,7 +375,7 @@ def main():
         if uploaded_file is not None:
             df_full = pd.read_csv(uploaded_file)
         else:
-            df_full = pd.read_csv('/Users/star/Desktop/NPF-2/NPF_with_CCN_merged2.csv')
+            df_full = pd.read_csv('/Users/star/Desktop/NPF-2/NPF_with_CCN_merged4.csv')
         
         # Apply row limit if enabled
         total_rows = len(df_full)
@@ -440,7 +444,7 @@ def main():
             st.dataframe(col_info, use_container_width=True, height=400)
             
             # Identify particle size columns
-            particle_cols = [col for col in df.columns if 'Particle_Size' in col or 'particle' in col.lower()]
+            particle_cols = [col for col in df.columns if is_particle_size_column(col)]
             
             st.subheader("Particle Size Columns")
             st.write(f"Found **{len(particle_cols)}** particle size columns")
@@ -732,7 +736,245 @@ def main():
                         file_name="size_distribution_data.csv",
                         mime="text/csv"
                     )
-        
+
+                # ===== Averaged Size Distribution with SS & CCN Overlay =====
+                st.divider()
+                st.markdown("### 📊 Averaged Size Distribution by SS Group")
+                st.info("""
+                **Purpose**: Select a pool of samples, group them by supersaturation level,
+                compute the **averaged** size distribution per SS group, and annotate the
+                peak of each curve with the mean CCN concentration for that group.
+                """)
+
+                # Detect SS / CCN columns for this module
+                _avg_ss_col = None
+                for _cn in ['supersaturation', 'Supersaturation', 'SS', 'ss', 'S',
+                            'supersaturation_%', 'SS_%', 'super_saturation']:
+                    if _cn in df.columns:
+                        _avg_ss_col = _cn
+                        break
+                _avg_has_ccn = 'N_CCN' in df.columns
+
+                avg_col1, avg_col2 = st.columns(2)
+
+                with avg_col1:
+                    avg_pool_size = st.slider(
+                        "Pool size (rows to consider)",
+                        min_value=100,
+                        max_value=min(len(df), 50000),
+                        value=min(len(df), 5000),
+                        step=100,
+                        key="avg_pool_size",
+                        help="Number of rows to draw samples from"
+                    )
+                    avg_sample_method = st.radio(
+                        "Pool selection method",
+                        ["First N rows", "Random sample", "Last N rows"],
+                        key="avg_pool_method"
+                    )
+                    avg_x_scale = st.radio(
+                        "X-axis scale",
+                        ["Logarithmic", "Linear"],
+                        key="avg_x_scale"
+                    )
+
+                with avg_col2:
+                    if _avg_ss_col is not None:
+                        avg_group_method = st.radio(
+                            "Grouping method",
+                            ["By SS bins (equal width)",
+                             "By specific SS values",
+                             "No grouping (grand average)"],
+                            key="avg_group_method"
+                        )
+                        if avg_group_method == "By SS bins (equal width)":
+                            avg_n_bins = st.selectbox(
+                                "Number of SS bins",
+                                options=[2, 3, 4, 5, 6],
+                                index=2,
+                                key="avg_n_bins"
+                            )
+                            avg_selected_ss = []
+                        elif avg_group_method == "By specific SS values":
+                            _ss_vals = sorted(df[_avg_ss_col].dropna().unique())
+                            avg_selected_ss = st.multiselect(
+                                "Select SS values",
+                                options=_ss_vals,
+                                default=_ss_vals[:min(4, len(_ss_vals))],
+                                key="avg_selected_ss"
+                            )
+                            avg_n_bins = 3
+                        else:
+                            avg_n_bins = 3
+                            avg_selected_ss = []
+                    else:
+                        avg_group_method = "No grouping (grand average)"
+                        avg_n_bins = 3
+                        avg_selected_ss = []
+                        st.info("ℹ️ No SS column found — will plot grand average only.")
+
+                    avg_show_std = st.checkbox(
+                        "Show ±1σ shading",
+                        value=True,
+                        key="avg_show_std",
+                        help="Shade ±1 standard deviation around each averaged curve"
+                    )
+                    avg_annotate_ccn = st.checkbox(
+                        "Annotate peak with mean CCN",
+                        value=_avg_has_ccn,
+                        disabled=not _avg_has_ccn,
+                        key="avg_annotate_ccn",
+                        help="Label the distribution peak with mean CCN for that group"
+                    )
+
+                if st.button("📊 Generate Averaged Distribution", key="btn_avg_dist",
+                             type="primary", use_container_width=True):
+
+                    # Build the pool
+                    if avg_sample_method == "First N rows":
+                        pool_df = df.head(avg_pool_size).copy()
+                    elif avg_sample_method == "Random sample":
+                        pool_df = df.sample(n=min(avg_pool_size, len(df)),
+                                            random_state=random_state).copy()
+                    else:
+                        pool_df = df.tail(avg_pool_size).copy()
+
+                    # All size bins, sorted by diameter
+                    _sorted_cols = sorted(diameter_map.keys(), key=lambda c: diameter_map[c])
+                    _sorted_dps  = [diameter_map[c] for c in _sorted_cols]
+
+                    # Build groups: label -> index list
+                    groups = {}
+
+                    if avg_group_method == "No grouping (grand average)" or _avg_ss_col is None:
+                        groups["All samples"] = pool_df.index.tolist()
+
+                    elif avg_group_method == "By SS bins (equal width)":
+                        _pool_ss = pool_df[_avg_ss_col].dropna()
+                        _ss_lo, _ss_hi = _pool_ss.min(), _pool_ss.max()
+                        _edges = np.linspace(_ss_lo, _ss_hi, avg_n_bins + 1)
+                        for _bi in range(avg_n_bins):
+                            _lo, _hi = _edges[_bi], _edges[_bi + 1]
+                            _last = (_bi == avg_n_bins - 1)
+                            _mask = (pool_df[_avg_ss_col] >= _lo) & (
+                                pool_df[_avg_ss_col] <= _hi if _last
+                                else pool_df[_avg_ss_col] < _hi
+                            )
+                            _idx = pool_df[_mask].index.tolist()
+                            if len(_idx) >= 5:
+                                groups[f"SS {_lo:.3f}–{_hi:.3f}%"] = _idx
+
+                    elif avg_group_method == "By specific SS values":
+                        if not avg_selected_ss:
+                            st.error("❌ Please select at least one SS value.")
+                            st.stop()
+                        for _sv in avg_selected_ss:
+                            _idx = pool_df[pool_df[_avg_ss_col] == _sv].index.tolist()
+                            if len(_idx) >= 3:
+                                groups[f"SS={_sv:.3f}%"] = _idx
+
+                    if len(groups) == 0:
+                        st.error("❌ No groups with sufficient samples found!")
+                        st.stop()
+
+                    st.success(f"✅ {len(groups)} group(s), pool: {len(pool_df):,} rows")
+
+                    # ---- Plot ----
+                    fig_avg, ax_avg = plt.subplots(figsize=(14, 7))
+                    _cmap_avg   = plt.cm.get_cmap("plasma")
+                    _grp_colors = _cmap_avg(np.linspace(0.1, 0.85, len(groups)))
+
+                    summary_rows = []
+
+                    for _gi, (_lbl, _idx_list) in enumerate(groups.items()):
+                        _mat = df.loc[_idx_list, _sorted_cols].values.astype(float)
+                        _mean = np.nanmean(_mat, axis=0)
+                        _std  = np.nanstd(_mat, axis=0)
+                        _col  = _grp_colors[_gi]
+                        _n    = len(_idx_list)
+
+                        # Mean CCN
+                        if _avg_has_ccn:
+                            _m_ccn = df.loc[_idx_list, 'N_CCN'].dropna().mean()
+                            _ccn_str = f", CCN={_m_ccn:.0f} cm⁻³"
+                        else:
+                            _m_ccn = np.nan
+                            _ccn_str = ""
+
+                        # Mean SS
+                        if _avg_ss_col is not None:
+                            _m_ss = df.loc[_idx_list, _avg_ss_col].dropna().mean()
+                        else:
+                            _m_ss = np.nan
+
+                        _leg = f"{_lbl} (n={_n}{_ccn_str})"
+
+                        ax_avg.plot(_sorted_dps, _mean, color=_col,
+                                    linewidth=2.5, label=_leg, zorder=3)
+
+                        if avg_show_std:
+                            ax_avg.fill_between(
+                                _sorted_dps,
+                                np.maximum(_mean - _std, 0),
+                                _mean + _std,
+                                color=_col, alpha=0.15, zorder=2
+                            )
+
+                        # Annotate peak with mean CCN
+                        if avg_annotate_ccn and _avg_has_ccn and not np.isnan(_m_ccn):
+                            _pk = int(np.nanargmax(_mean))
+                            ax_avg.annotate(
+                                f"CCN={_m_ccn:.0f}",
+                                xy=(_sorted_dps[_pk], _mean[_pk]),
+                                xytext=(0, 14), textcoords='offset points',
+                                ha='center', va='bottom', fontsize=9,
+                                fontweight='bold', color=_col,
+                                arrowprops=dict(arrowstyle='->', color=_col, lw=1.2)
+                            )
+
+                        summary_rows.append({
+                            'Group': _lbl,
+                            'N samples': _n,
+                            'Mean SS (%)': f"{_m_ss:.3f}" if not np.isnan(_m_ss) else "–",
+                            'Mean CCN (cm⁻³)': f"{_m_ccn:.1f}" if not np.isnan(_m_ccn) else "–",
+                            'Peak Dp (nm)': f"{_sorted_dps[int(np.nanargmax(_mean))]:.1f}",
+                            'Mean Total N (cm⁻³)': f"{np.nansum(_mean):.1f}"
+                        })
+
+                    if avg_x_scale == "Logarithmic":
+                        ax_avg.set_xscale('log')
+                    ax_avg.set_xlabel('Particle Diameter (nm)', fontsize=13, fontweight='bold')
+                    ax_avg.set_ylabel('Mean dN/dlogDp (cm⁻³)', fontsize=13, fontweight='bold')
+                    ax_avg.set_title(
+                        f'Averaged Particle Size Distribution by SS Group\n'
+                        f'(pool: {len(pool_df):,} rows, {len(groups)} group(s))',
+                        fontsize=14, fontweight='bold', pad=15
+                    )
+                    ax_avg.legend(bbox_to_anchor=(1.02, 1), loc='upper left',
+                                  fontsize=9, framealpha=0.9)
+                    ax_avg.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+                    plt.tight_layout()
+                    st.pyplot(fig_avg)
+
+                    # Summary table
+                    st.markdown("#### 📋 Group Summary")
+                    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+
+                    # Export averaged curves
+                    _avg_export = pd.DataFrame(
+                        {_lbl: np.nanmean(
+                            df.loc[_idx_list, _sorted_cols].values.astype(float), axis=0)
+                         for _lbl, _idx_list in groups.items()},
+                        index=[f"{_d:.2f}nm" for _d in _sorted_dps]
+                    ).reset_index().rename(columns={'index': 'Diameter'})
+
+                    st.download_button(
+                        label="📥 Download Averaged Data (CSV)",
+                        data=_avg_export.to_csv(index=False),
+                        file_name="averaged_size_distribution.csv",
+                        mime="text/csv"
+                    )
+
         # ===== Tab 1.75: Size-CCN Analysis =====
         with tab1_75:
             st.markdown('<h2 class="sub-header">🎯 Supersaturation-Dependent Size Importance Analysis</h2>', 
@@ -817,7 +1059,7 @@ def main():
                     all_diameters = sorted([diameter_map[col] for col in size_bins['Column'].values])
                     min_available = all_diameters[0]
                     max_available = all_diameters[-1]
-                    default_min_diameter = max(50.0, float(min_available))
+                    default_min_diameter = max(30.0, float(min_available))
                     
                     size_range = st.slider(
                         "Size range (nm)",
@@ -1160,6 +1402,12 @@ def main():
                                     # Select top sizes based on max importance across bins
                                     max_imp_per_size = imp_matrix.max(axis=0)
                                     top_indices = np.argsort(max_imp_per_size)[-top_n:][::-1]
+                                    top_cols = [filtered_cols[i] for i in top_indices]
+                                    top_diameters = [diameter_map[col] for col in top_cols]
+
+                                    # Reorder selected top sizes by physical diameter (small -> large)
+                                    diameter_sort_idx = np.argsort(top_diameters)
+                                    top_indices = np.array(top_indices)[diameter_sort_idx]
                                     top_cols = [filtered_cols[i] for i in top_indices]
                                     top_diameters = [diameter_map[col] for col in top_cols]
                                     
@@ -1711,44 +1959,52 @@ def main():
                 # 1. Lognormal Modes (fitted features)
                 mode_features = ['N_nucleation', 'N_Aitken', 'N_accumulation']
 
-                # 2. Particle Size Distribution (raw SMPS/NanoSMPS data)
-                size_features = [col for col in df_with_modes.columns if 'Particle_Size' in col]
+                # 2. Particle Size Distribution (raw SMPS data)
+                size_features = [col for col in df_with_modes.columns if is_particle_size_column(col)]
                 
                 # 3. Aerosol Statistics (geometric mean, total concentration, etc.)
                 aerosol_stat_patterns = ['geometric_mean', 'total_n_conc', 'arithmetic_mean', 
                                         'percentage_below', 'mode_interp', 'total_sa_conc']
                 aerosol_stat_features = [col for col in df_with_modes.columns 
                                         if any(pattern in col.lower() for pattern in aerosol_stat_patterns)]
+
+                # 4. Supersaturation Features
+                ss_features = [col for col in df_with_modes.columns if is_supersaturation_feature(col)]
+                ss_feature_set = set(ss_features)
                 
-                # 4. Meteorological Features
+                # 5. Meteorological Features
                 met_patterns = ['temperature', 'temp', 'rh', 'humidity', 'wind_direction', 
                                'wind_speed', 'wind', 'pressure', 'precip', 'bl_height']
                 met_features = [col for col in df_with_modes.columns 
                                if any(pattern in col.lower() for pattern in met_patterns)
+                               and col not in ss_feature_set
                                and not any(p in col.lower() for p in ['organic', 'sulfate', 'nitrate', 'so2'])]
                 
-                # 5. Chemical Composition Features
+                # 6. Chemical Composition Features
                 chem_patterns = ['organic', 'sulfate', 'sulphate', 'nitrate', 'so2', 
                                 'nox', 'no2', 'o3', 'ozone', 'nh3', 'nh4', 'ammonium', 'bc', 'pm']
                 chem_features = [col for col in df_with_modes.columns 
-                                if any(pattern in col.lower() for pattern in chem_patterns)]
+                                if col not in ss_feature_set
+                                and any(pattern in col.lower() for pattern in chem_patterns)]
                 
-                # 6. Turbulence & Energy Features
+                # 7. Turbulence & Energy Features
                 turbulence_patterns = ['turbulent', 'kinetic_energy', 'friction', 'momentum']
                 turbulence_features = [col for col in df_with_modes.columns 
                                       if any(pattern in col.lower() for pattern in turbulence_patterns)]
                 
-                # 7. Radiation Features
+                # 8. Radiation Features
                 radiation_patterns = ['flux', 'radiation', 'diffuse', 'hemisp', 'short', 'down', 'up',
                                      'bestestimate', 'solar', 'irradiance']
                 radiation_features = [col for col in df_with_modes.columns 
                                      if any(pattern in col.lower() for pattern in radiation_patterns)
+                                     and col not in ss_feature_set
                                      and 'co2' not in col.lower()]
                 
-                # 8. CO2 Flux Features
+                # 9. CO2 Flux Features
                 co2_patterns = ['co2']
                 co2_features = [col for col in df_with_modes.columns 
-                               if any(pattern in col.lower() for pattern in co2_patterns)]
+                               if any(pattern in col.lower() for pattern in co2_patterns)
+                               and col not in ss_feature_set]
                 
                 # Filter available features and ensure they are numeric
                 available_mode = [f for f in mode_features 
@@ -1758,6 +2014,10 @@ def main():
                 available_aerosol_stats = [f for f in aerosol_stat_features 
                                           if f in df_with_modes.columns and 
                                           pd.api.types.is_numeric_dtype(df_with_modes[f])]
+
+                available_ss = [f for f in ss_features
+                               if f in df_with_modes.columns and
+                               pd.api.types.is_numeric_dtype(df_with_modes[f])]
                 
                 available_met = [f for f in met_features 
                                 if f in df_with_modes.columns and 
@@ -1789,13 +2049,14 @@ def main():
                 - Aerosol Statistics: **{len(available_aerosol_stats)}** features
                 
                 🌡️ **Environmental Features:**
+                - Supersaturation: **{len(available_ss)}** features
                 - Meteorological: **{len(available_met)}** features
                 - Chemical Composition: **{len(available_chem)}** features
                 - Turbulence & Energy: **{len(available_turbulence)}** features
                 - Radiation: **{len(available_radiation)}** features
                 - CO2 Flux: **{len(available_co2)}** features
                 
-                📈 **Total Available: {len(available_mode) + len(size_features) + len(available_aerosol_stats) + len(available_met) + len(available_chem) + len(available_turbulence) + len(available_radiation) + len(available_co2)}** features
+                📈 **Total Available: {len(available_mode) + len(size_features) + len(available_aerosol_stats) + len(available_ss) + len(available_met) + len(available_chem) + len(available_turbulence) + len(available_radiation) + len(available_co2)}** features
                 """)
                 
                 # Feature selection UI
@@ -1829,6 +2090,11 @@ def main():
                 with st.expander("🌡️ Environmental Features", expanded=True):
                     col1, col2 = st.columns(2)
                     with col1:
+                        use_ss = st.checkbox(
+                            f"Supersaturation ({len(available_ss)})",
+                            value=True,
+                            help="Supersaturation column used as an independent predictor"
+                        )
                         use_met = st.checkbox(
                             f"Meteorological ({len(available_met)})", 
                             value=True,
@@ -1860,6 +2126,8 @@ def main():
                         )
                     
                     # Show feature previews
+                    if use_ss and available_ss:
+                        st.caption(f"💧 Supersaturation: {', '.join(available_ss)}")
                     if use_met and available_met:
                         st.caption(f"🌡️ Meteorological: {', '.join(available_met[:4])}{'...' if len(available_met) > 4 else ''}")
                     if use_chem and available_chem:
@@ -1872,25 +2140,25 @@ def main():
                 with col_quick1:
                     if st.button("✅ Select All", help="Select all available feature categories"):
                         use_modes = use_aerosol_stats = use_size = True
-                        use_met = use_chem = use_turbulence = use_radiation = use_co2 = True
+                        use_ss = use_met = use_chem = use_turbulence = use_radiation = use_co2 = True
                         st.rerun()
                 
                 with col_quick2:
                     if st.button("🔬 Aerosol Only", help="Only aerosol-related features"):
                         use_modes = use_aerosol_stats = use_size = True
-                        use_met = use_chem = use_turbulence = use_radiation = use_co2 = False
+                        use_ss = use_met = use_chem = use_turbulence = use_radiation = use_co2 = False
                         st.rerun()
                 
                 with col_quick3:
                     if st.button("🎯 Recommended", help="Recommended feature set for CCN prediction"):
-                        use_modes = use_aerosol_stats = use_met = use_chem = True
+                        use_modes = use_aerosol_stats = use_ss = use_met = use_chem = True
                         use_size = use_turbulence = use_radiation = use_co2 = False
                         st.rerun()
                 
                 with col_quick4:
                     if st.button("⬜ Clear All", help="Deselect all features"):
                         use_modes = use_aerosol_stats = use_size = False
-                        use_met = use_chem = use_turbulence = use_radiation = use_co2 = False
+                        use_ss = use_met = use_chem = use_turbulence = use_radiation = use_co2 = False
                         st.rerun()
                 
                 st.divider()
@@ -1909,6 +2177,9 @@ def main():
                     if use_size and size_features:
                         feature_list.extend(size_features)
                         feature_categories.append(f"Size Distribution ({len(size_features)})")
+                    if use_ss and available_ss:
+                        feature_list.extend(available_ss)
+                        feature_categories.append(f"Supersaturation ({len(available_ss)})")
                     if use_met and available_met:
                         feature_list.extend(available_met)
                         feature_categories.append(f"Meteorological ({len(available_met)})")
@@ -1924,6 +2195,10 @@ def main():
                     if use_co2 and available_co2:
                         feature_list.extend(available_co2)
                         feature_categories.append(f"CO2 Flux ({len(available_co2)})")
+
+                    # Hard guard against supersaturation leakage when SS category is not selected.
+                    if not use_ss:
+                        feature_list = [f for f in feature_list if f not in ss_feature_set]
                     
                     # Display selected categories
                     st.success(f"✅ Selected {len(feature_categories)} categories: {', '.join(feature_categories)}")
@@ -1940,12 +2215,22 @@ def main():
                     
                     # Prepare data
                     available_features = [f for f in feature_list if f in df_with_modes.columns]
+
+                    # Final defensive check before model training.
+                    if not use_ss:
+                        available_features = [f for f in available_features if f not in ss_feature_set]
                     
                     if len(available_features) == 0:
                         st.error("❌ None of the selected features are available in the dataset!")
                         st.stop()
                     
                     st.write(f"✅ Selected **{len(available_features)}** features")
+
+                    selected_ss_in_training = [f for f in available_features if f in ss_feature_set]
+                    if selected_ss_in_training:
+                        st.warning(f"⚠️ Supersaturation features in training: {selected_ss_in_training}")
+                    else:
+                        st.info("✅ Verification: no supersaturation feature in final training set")
                     
                     # Show selected features
                     with st.expander("View selected features"):
@@ -2112,7 +2397,9 @@ def main():
                     fig, ax = plt.subplots(figsize=(10, 8))
                     
                     top_n = min(20, len(importance_df))
-                    importance_df.head(top_n).plot(
+                    # Reverse the plotted subset so the most important feature appears at the top.
+                    plot_df = importance_df.head(top_n).iloc[::-1]
+                    plot_df.plot(
                         x='Feature',
                         y='Importance',
                         kind='barh',
@@ -2161,6 +2448,13 @@ def main():
                             try:
                                 X_test_scaled = st.session_state['X_test_scaled']
 
+                                if X_test_scaled.shape[1] != len(features):
+                                    st.error(
+                                        f"❌ Feature mismatch: model expects {X_test_scaled.shape[1]} columns, "
+                                        f"but feature list has {len(features)}. Please retrain the model."
+                                    )
+                                    st.stop()
+
                                 # Keep SHAP compute bounded for responsiveness.
                                 sample_n = min(shap_sample_size, len(X_test_scaled))
                                 sampled_idx = np.random.RandomState(random_state).choice(
@@ -2174,8 +2468,16 @@ def main():
                                     columns=features
                                 )
 
-                                explainer = shap.TreeExplainer(model)
-                                shap_values = explainer.shap_values(X_shap)
+                                # Prefer TreeExplainer; gracefully fallback for models/versions that need generic Explainer.
+                                try:
+                                    explainer = shap.TreeExplainer(model)
+                                    try:
+                                        shap_values = explainer.shap_values(X_shap, check_additivity=False)
+                                    except TypeError:
+                                        shap_values = explainer.shap_values(X_shap)
+                                except Exception:
+                                    explainer = shap.Explainer(model, X_shap)
+                                    shap_values = explainer(X_shap).values
 
                                 if isinstance(shap_values, list):
                                     shap_values = shap_values[0]
@@ -2250,7 +2552,11 @@ def main():
 
                             except Exception as e:
                                 st.error(f"❌ SHAP analysis failed: {str(e)}")
-                                st.info("Tip: try a smaller SHAP sample size or switch to Random Forest/XGBoost.")
+                                st.info(
+                                    "Tips: (1) retrain model and run again, "
+                                    "(2) try a smaller SHAP sample size, "
+                                    "(3) try Random Forest/XGBoost."
+                                )
         
         # ===== Tab 5: Export =====
         with tab5:
