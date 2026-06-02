@@ -279,9 +279,9 @@ def main():
         
         # Use default file if nothing uploaded
         if uploaded_file is None:
-            default_file = '/Users/star/Desktop/NPF-2/NPF_with_CCN_merged4.csv'
-            if Path(default_file).exists():
-                st.info(f"Using default file:\n`{Path(default_file).name}`")
+            default_file = Path(__file__).parent / 'NPF_with_CCN_merged4.csv'
+            if default_file.exists():
+                st.info(f"Using default file:\n`{default_file.name}`")
                 use_default = st.checkbox("Load default dataset", value=True)
             else:
                 use_default = False
@@ -375,7 +375,7 @@ def main():
         if uploaded_file is not None:
             df_full = pd.read_csv(uploaded_file)
         else:
-            df_full = pd.read_csv('/Users/star/Desktop/NPF-2/NPF_with_CCN_merged4.csv')
+            df_full = pd.read_csv(Path(__file__).parent / 'NPF_with_CCN_merged4.csv')
         
         # Apply row limit if enabled
         total_rows = len(df_full)
